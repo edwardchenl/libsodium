@@ -163,8 +163,9 @@ salsa20_8(uint32_t B[16])
         x[15] ^= R(x[14] + x[13], 18);
 #undef R
     }
-    for (i = 0; i < 16; i++)
+    for (i = 0; i < 16; i++) {
         B[i] += x[i];
+    }
 }
 
 /**
@@ -180,20 +181,23 @@ blockmix_salsa8(const uint32_t *Bin, uint32_t *Bout, uint32_t *X, size_t r)
 
     /* 1: X <-- B_{2r - 1} */
     blkcpy_64((escrypt_block_t *) X,
-              (escrypt_block_t *) &Bin[(2 * r - 1) * 16]);
+              (const escrypt_block_t *) &Bin[(2 * r - 1) * 16]);
 
     /* 2: for i = 0 to 2r - 1 do */
     for (i = 0; i < 2 * r; i += 2) {
         /* 3: X <-- H(X \xor B_i) */
-        blkxor_64((escrypt_block_t *) X, (escrypt_block_t *) &Bin[i * 16]);
+        blkxor_64((escrypt_block_t *) X,
+                  (const escrypt_block_t *) &Bin[i * 16]);
         salsa20_8(X);
 
         /* 4: Y_i <-- X */
         /* 6: B' <-- (Y_0, Y_2 ... Y_{2r-2}, Y_1, Y_3 ... Y_{2r-1}) */
-        blkcpy_64((escrypt_block_t *) &Bout[i * 8], (escrypt_block_t *) X);
+        blkcpy_64((escrypt_block_t *) &Bout[i * 8],
+                  (const escrypt_block_t *) X);
 
         /* 3: X <-- H(X \xor B_i) */
-        blkxor_64((escrypt_block_t *) X, (escrypt_block_t *) &Bin[i * 16 + 16]);
+        blkxor_64((escrypt_block_t *) X,
+                  (const escrypt_block_t *) &Bin[i * 16 + 16]);
         salsa20_8(X);
 
         /* 4: Y_i <-- X */
@@ -347,10 +351,10 @@ escrypt_kdf_nosse(escrypt_local_t *local, const uint8_t *passwd,
         return -1;
     }
     if (local->size < need) {
-        if (free_region(local)) {
+        if (escrypt_free_region(local)) {
             return -1;
         }
-        if (!alloc_region(local, need)) {
+        if (!escrypt_alloc_region(local, need)) {
             return -1;
         }
     }
@@ -359,7 +363,7 @@ escrypt_kdf_nosse(escrypt_local_t *local, const uint8_t *passwd,
     XY = (uint32_t *) ((uint8_t *) V + V_size);
 
     /* 1: (B_0 ... B_{p-1}) <-- PBKDF2(P, S, 1, p * MFLen) */
-    PBKDF2_SHA256(passwd, passwdlen, salt, saltlen, 1, B, B_size);
+    escrypt_PBKDF2_SHA256(passwd, passwdlen, salt, saltlen, 1, B, B_size);
 
     /* 2: for i = 0 to p - 1 do */
     for (i = 0; i < p; i++) {
@@ -368,7 +372,7 @@ escrypt_kdf_nosse(escrypt_local_t *local, const uint8_t *passwd,
     }
 
     /* 5: DK <-- PBKDF2(P, B, 1, dkLen) */
-    PBKDF2_SHA256(passwd, passwdlen, B, B_size, 1, buf, buflen);
+    escrypt_PBKDF2_SHA256(passwd, passwdlen, B, B_size, 1, buf, buflen);
 
     /* Success! */
     return 0;

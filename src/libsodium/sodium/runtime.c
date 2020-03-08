@@ -3,6 +3,14 @@
 #ifdef HAVE_ANDROID_GETCPUFEATURES
 # include <cpu-features.h>
 #endif
+#ifdef __APPLE__
+# include <sys/types.h>
+# include <sys/sysctl.h>
+# include <mach/machine.h>
+#endif
+#ifdef HAVE_SYS_AUXV_H
+# include <sys/auxv.h>
+#endif
 
 #include "private/common.h"
 #include "runtime.h"
@@ -10,6 +18,7 @@
 typedef struct CPUFeatures_ {
     int initialized;
     int has_neon;
+    int has_armcrypto;
     int has_sse2;
     int has_sse3;
     int has_ssse3;
@@ -39,31 +48,65 @@ static CPUFeatures _cpu_features;
 
 #define CPUID_EDX_SSE2    0x04000000
 
-#define XCR0_SSE 0x00000002
-#define XCR0_AVX 0x00000004
+#define XCR0_SSE       0x00000002
+#define XCR0_AVX       0x00000004
+#define XCR0_OPMASK    0x00000020
+#define XCR0_ZMM_HI256 0x00000040
+#define XCR0_HI16_ZMM  0x00000080
 
 static int
 _sodium_runtime_arm_cpu_features(CPUFeatures * const cpu_features)
 {
-#ifndef __arm__
     cpu_features->has_neon = 0;
-    return -1;
-#else
-# ifdef __APPLE__
-#  ifdef __ARM_NEON__
+    cpu_features->has_armcrypto = 0;
+
+#ifndef __ARM_ARCH
+    return -1; /* LCOV_EXCL_LINE */
+#endif
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
     cpu_features->has_neon = 1;
-#  else
-    cpu_features->has_neon = 0;
-#  endif
-# elif defined(HAVE_ANDROID_GETCPUFEATURES) && \
-    defined(ANDROID_CPU_ARM_FEATURE_NEON)
+#elif defined(HAVE_ANDROID_GETCPUFEATURES) && defined(ANDROID_CPU_ARM_FEATURE_NEON)
     cpu_features->has_neon =
         (android_getCpuFeatures() & ANDROID_CPU_ARM_FEATURE_NEON) != 0x0;
-# else
-    cpu_features->has_neon = 0;
-# endif
-    return 0;
+#elif defined(HAVE_GETAUXVAL) && defined(AT_HWCAP) && defined(__aarch64__)
+    cpu_features->has_neon = (getauxval(AT_HWCAP) & (1L << 1)) != 0;
+#elif defined(HAVE_GETAUXVAL) && defined(AT_HWCAP) && defined(__arm__)
+    cpu_features->has_neon = (getauxval(AT_HWCAP) & (1L << 12)) != 0;
 #endif
+
+    if (cpu_features->has_neon == 0) {
+        return 0;
+    }
+
+#if __ARM_FEATURE_CRYPTO
+    cpu_features->has_armcrypto = 1;
+#elif defined(__APPLE__) && defined(CPU_TYPE_ARM64) && defined(CPU_SUBTYPE_ARM64E)
+    {
+        cpu_type_t    cpu_type;
+        cpu_subtype_t cpu_subtype;
+        size_t        cpu_type_len = sizeof cpu_type;
+        size_t        cpu_subtype_len = sizeof cpu_subtype;
+
+        if (sysctlbyname("hw.cputype", &cpu_type, &cpu_type_len,
+                         NULL, 0) == 0 && cpu_type == CPU_TYPE_ARM64 &&
+            sysctlbyname("hw.cpusubtype", &cpu_subtype, &cpu_subtype_len,
+                         NULL, 0) == 0 &&
+            (cpu_subtype == CPU_SUBTYPE_ARM64E ||
+                cpu_subtype == CPU_SUBTYPE_ARM64_V8)) {
+            cpu_features->has_armcrypto = 1;
+        }
+    }
+#elif defined(HAVE_ANDROID_GETCPUFEATURES) && defined(ANDROID_CPU_ARM_FEATURE_AES)
+    cpu_features->has_armcrypto =
+        (android_getCpuFeatures() & ANDROID_CPU_ARM_FEATURE_AES) != 0x0;
+#elif defined(HAVE_GETAUXVAL) && defined(AT_HWCAP) && defined(__aarch64__)
+    cpu_features->has_armcrypto = (getauxval(AT_HWCAP) & (1L << 3)) != 0;
+#elif defined(HAVE_GETAUXVAL) && defined(AT_HWCAP2) && defined(__arm__)
+    cpu_features->has_armcrypto = (getauxval(AT_HWCAP2) & (1L << 0)) != 0;
+#endif
+
+    return 0;
 }
 
 static void
@@ -114,6 +157,7 @@ _sodium_runtime_intel_cpu_features(CPUFeatures * const cpu_features)
 {
     unsigned int cpu_info[4];
     unsigned int id;
+    uint32_t     xcr0 = 0U;
 
     _cpuid(cpu_info, 0x0);
     if ((id = cpu_info[0]) == 0U) {
@@ -145,10 +189,12 @@ _sodium_runtime_intel_cpu_features(CPUFeatures * const cpu_features)
 #endif
 
     cpu_features->has_avx = 0;
+
+    (void) xcr0;
 #ifdef HAVE_AVXINTRIN_H
     if ((cpu_info[2] & (CPUID_ECX_AVX | CPUID_ECX_XSAVE | CPUID_ECX_OSXSAVE)) ==
         (CPUID_ECX_AVX | CPUID_ECX_XSAVE | CPUID_ECX_OSXSAVE)) {
-        uint32_t xcr0 = 0U;
+        xcr0 = 0U;
 # if defined(HAVE__XGETBV) || \
         (defined(_MSC_VER) && defined(_XCR_XFEATURE_ENABLED_MASK) && _MSC_FULL_VER >= 160040219)
         xcr0 = (uint32_t) _xgetbv(0);
@@ -197,7 +243,13 @@ _sodium_runtime_intel_cpu_features(CPUFeatures * const cpu_features)
         unsigned int cpu_info7[4];
 
         _cpuid(cpu_info7, 0x00000007);
-        cpu_features->has_avx512f = ((cpu_info7[1] & CPUID_EBX_AVX512F) != 0x0);
+        /* LCOV_EXCL_START */
+        if ((cpu_info7[1] & CPUID_EBX_AVX512F) == CPUID_EBX_AVX512F &&
+            (xcr0 & (XCR0_OPMASK | XCR0_ZMM_HI256 | XCR0_HI16_ZMM))
+            == (XCR0_OPMASK | XCR0_ZMM_HI256 | XCR0_HI16_ZMM)) {
+            cpu_features->has_avx512f = 1;
+        }
+        /* LCOV_EXCL_STOP */
     }
 #endif
 
@@ -234,6 +286,12 @@ int
 sodium_runtime_has_neon(void)
 {
     return _cpu_features.has_neon;
+}
+
+int
+sodium_runtime_has_armcrypto(void)
+{
+    return _cpu_features.has_armcrypto;
 }
 
 int
